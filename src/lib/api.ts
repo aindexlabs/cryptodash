@@ -1,27 +1,16 @@
-// import { format } from 'date-fns';
 import type { Time } from 'lightweight-charts';
-import axios from 'axios';
+import {
+    getTickerData,
+    getOHLCData,
+    getKrakenPair,
+    getKrakenInterval
+} from '@/services/kraken';
+import {
+    getMarketData,
+    COINGECKO_IDS
+} from '@/services/coingecko';
 
-const API_BASE = 'https://api.freecryptoapi.com/v1';
-const MOCK_MODE = !import.meta.env.VITE_API_KEY; // Use mock if no key
-
-// Create Axios instance
-const apiClient = axios.create({
-    baseURL: API_BASE,
-    timeout: 20000,
-    headers: {
-        'Content-Type': 'application/json',
-    },
-});
-
-// Add interceptor for Bearer token
-apiClient.interceptors.request.use((config) => {
-    const token = import.meta.env.VITE_API_KEY;
-    if (token) {
-        config.headers.Authorization = `Bearer ${token}`;
-    }
-    return config;
-});
+const MOCK_MODE = import.meta.env.VITE_USE_MOCK === 'true';
 
 export interface Coin {
     name: string;
@@ -100,10 +89,70 @@ export const api = {
             await new Promise(resolve => setTimeout(resolve, 500)); // Simulate latency
             return generateMockCoins();
         }
+
         try {
-            const response = await apiClient.get('/getCryptoList');
-            // Note: Adjust response mapping based on actual API structure
-            return response.data.data || response.data;
+            // Get market data from CoinGecko for top coins
+            const marketData = await getMarketData('usd', 100, 1);
+
+            // Filter to only coins we have Kraken pairs for
+            const supportedCoins = marketData.filter(coin =>
+                COINGECKO_IDS[coin.symbol.toUpperCase()]
+            );
+
+            // Get the symbols we want to fetch from Kraken
+            const symbols = supportedCoins
+                .slice(0, 10)
+                .map(coin => coin.symbol.toUpperCase());
+
+            // Get Kraken pairs for these symbols
+            const krakenPairs = symbols.map(symbol => getKrakenPair(symbol));
+
+            // Fetch ticker data from Kraken
+            const tickerResponse = await getTickerData(krakenPairs);
+
+            if (tickerResponse.error && tickerResponse.error.length > 0) {
+                console.error('Kraken API Error:', tickerResponse.error);
+                return [];
+            }
+
+            // Merge Kraken price data with CoinGecko market data
+            const coins: Coin[] = [];
+
+            for (const coin of supportedCoins.slice(0, 10)) {
+                const symbol = coin.symbol.toUpperCase();
+                const krakenPair = getKrakenPair(symbol);
+                const tickerData = tickerResponse.result[krakenPair];
+
+                if (tickerData) {
+                    // Use Kraken price, CoinGecko for everything else
+                    const currentPrice = parseFloat(tickerData.c[0]);
+                    const openPrice = parseFloat(tickerData.o);
+                    const change24h = ((currentPrice - openPrice) / openPrice) * 100;
+
+                    coins.push({
+                        name: coin.name,
+                        symbol: symbol,
+                        price: currentPrice,
+                        change24h: change24h,
+                        marketCap: coin.market_cap,
+                        volume24h: coin.total_volume,
+                        circulatingSupply: coin.circulating_supply,
+                    });
+                } else {
+                    // Fallback to CoinGecko data only
+                    coins.push({
+                        name: coin.name,
+                        symbol: symbol,
+                        price: coin.current_price,
+                        change24h: coin.price_change_percentage_24h,
+                        marketCap: coin.market_cap,
+                        volume24h: coin.total_volume,
+                        circulatingSupply: coin.circulating_supply,
+                    });
+                }
+            }
+
+            return coins;
         } catch (error) {
             console.error("API Error:", error);
             return [];
@@ -116,12 +165,37 @@ export const api = {
             const days = timeframe === '1h' ? 1 / 24 : timeframe === '24h' ? 1 : timeframe === '7d' ? 7 : 30;
             return generateMockHistory(days);
         }
+
         try {
-            // Example endpoint mapping
-            const response = await apiClient.get(`/getHistory`, {
-                params: { symbol, timeframe }
-            });
-            return response.data.data || response.data;
+            const krakenPair = getKrakenPair(symbol);
+            const interval = getKrakenInterval(timeframe);
+
+            const ohlcResponse = await getOHLCData(krakenPair, interval);
+
+            if (ohlcResponse.error && ohlcResponse.error.length > 0) {
+                console.error('Kraken OHLC Error:', ohlcResponse.error);
+                return [];
+            }
+
+            // Get the OHLC data array (the key is the pair name)
+            const ohlcData = ohlcResponse.result[krakenPair];
+
+            // Type guard: ensure we have an array, not the 'last' timestamp
+            if (!ohlcData || typeof ohlcData === 'number' || !Array.isArray(ohlcData) || ohlcData.length === 0) {
+                return [];
+            }
+
+            // Transform Kraken OHLC format to our Candle format
+            // Kraken format: [time, open, high, low, close, vwap, volume, count]
+            const candles: Candle[] = ohlcData.map((item: [number, string, string, string, string, string, string, number]) => ({
+                time: item[0] as Time,
+                open: parseFloat(item[1]),
+                high: parseFloat(item[2]),
+                low: parseFloat(item[3]),
+                close: parseFloat(item[4]),
+            }));
+
+            return candles;
         } catch (error) {
             console.error("API Error:", error);
             return [];
